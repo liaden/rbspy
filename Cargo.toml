@@ -15,7 +15,7 @@ edition = "2018"
 
 [dependencies]
 chrono = "0.4"
-clap = "2"
+clap = { git = "https://github.com/clap-rs/clap" }
 ctrlc = "3.1.0"
 elf = "0.0.10"
 log = "0.4.6"
