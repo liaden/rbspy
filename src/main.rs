@@ -79,7 +79,7 @@ enum Target {
 arg_enum!{
     // The values of this enum get translated directly to command line arguments. Make them
     // lowercase so that we don't have camelcase command line arguments
-    #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+    #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
     #[allow(non_camel_case_types)]
     pub enum OutputFormat {
         flamegraph,
@@ -107,7 +107,12 @@ enum SubCmd {
     },
     /// Capture and print a stacktrace snapshot of process `pid`.
     Snapshot { pid: Pid },
-    Report { format: OutputFormat, input: PathBuf, output: PathBuf, },
+    Report {
+        formats: Vec<OutputFormat>,
+        input: Vec<PathBuf>,
+        output: Option<String>,
+        merge: bool,
+    },
 }
 use SubCmd::*;
 
@@ -199,7 +204,7 @@ fn do_main() -> Result<(), Error> {
                 maybe_duration,
             )
         },
-        Report{format, input, output} => report(format, input, output),
+        Report{formats, input, output, merge} => generate_report(formats, input, output, merge),
     }
 }
 
@@ -298,7 +303,7 @@ fn snapshot(pid: Pid) -> Result<(), Error> {
 }
 
 impl OutputFormat {
-    fn outputter(self) -> Box<dyn ui::output::Outputter> {
+    fn outputter(&self) -> Box<dyn ui::output::Outputter> {
         match self {
             OutputFormat::flamegraph => Box::new(output::Flamegraph(ui::flamegraph::Stats::new())),
             OutputFormat::callgrind => Box::new(output::Callgrind(ui::callgrind::Stats::new())),
@@ -310,13 +315,39 @@ impl OutputFormat {
 
     fn extension(&self) -> String {
         match *self {
-            OutputFormat::flamegraph => "flamegraph.svg",
-            OutputFormat::callgrind => "callgrind.txt",
-            OutputFormat::speedscope => "speedscope.json",
-            OutputFormat::summary => "summary.txt",
-            OutputFormat::summary_by_line => "summary_by_line.txt",
+            OutputFormat::flamegraph => "svg",
+            OutputFormat::callgrind => "txt",
+            OutputFormat::speedscope => "json",
+            OutputFormat::summary => "txt",
+            OutputFormat::summary_by_line => "txt",
         }.to_string()
     }
+
+    fn basename(&self, extra: &str) -> String {
+        let extra_join = if extra.is_empty() { "" } else { "-" };
+        format!("{}{}{}.{}", extra, extra_join, self, self.extension()).to_string()
+    }
+
+    fn basename_from(&self, input: &PathBuf) -> String {
+        let mut input_name = input.to_str().unwrap().to_string();
+        if input_name.ends_with(".raw.gz") {
+            input_name.truncate(input_name.len() - 7)
+        }
+        format!("{}.{}", input_name, self.extension()).to_string()
+    }
+}
+
+#[test]
+fn test_output_format_basename() {
+    assert_eq!(OutputFormat::flamegraph.basename(""), "flamegraph.svg");
+    assert_eq!(OutputFormat::flamegraph.basename("merged"), "merged-flamegraph.svg");
+    assert_eq!(OutputFormat::speedscope.basename(""), "speedscope.json");
+}
+
+#[test]
+fn test_outputformat_basename_from() {
+    let input = PathBuf::from("rbspy-2019-11-20-lwOWzPTUnS.raw.gz".to_string());
+    assert_eq!(OutputFormat::flamegraph.basename_from(&input), "rbspy-2019-11-20-lwOWzPTUnS.svg");
 }
 
 // This SampleTime struct helps us sample on a regular schedule ("exactly" 100 times per second, if
@@ -637,11 +668,33 @@ fn record(
     Ok(())
 }
 
-fn report(format: OutputFormat, input: PathBuf, output: PathBuf) -> Result<(), Error>{
+fn generate_report(formats: Vec<OutputFormat>, inputs: Vec<PathBuf>, output: Option<String>, merged: bool) -> Result<(), Error> {
+    if merged {
+        let samples = storage::from_pathbufs(inputs)?.0;
+        for format in formats {
+            let output = format.basename(&output.clone().unwrap_or_else(|| "merged".to_string()));
+            let mut outputter = format.outputter();
+            for trace in samples.clone() {
+                outputter.record(&trace)?;
+            }
+            outputter.complete(File::create(output)?)?;
+        }
+    } else {
+        for format in formats {
+            for input in inputs.clone() {
+                report(format.clone(), input, output.clone())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report(format: OutputFormat, input: PathBuf, output: Option<String>) -> Result<(), Error> {
+    let output = output.unwrap_or_else(|| format.basename_from(&input));
     let input_file = File::open(input)?;
-    let stuff = storage::from_reader(input_file)?.0;
+    let samples = storage::from_reader(input_file)?.0;
     let mut outputter = format.outputter();
-    for trace in stuff {
+    for trace in samples {
         outputter.record(&trace)?;
     }
     outputter.complete(File::create(output)?)?;
@@ -803,10 +856,11 @@ fn arg_parser() -> App<'static, 'static> {
         .subcommand(
             SubCommand::with_name("report")
                 .about("Generate visualization from raw data recorded by `rbspy record`")
-                .arg(Arg::from_usage("-i --input=<FILE> 'Input raw data to use'"))
-                .arg(Arg::from_usage("-o --output=<FILE> 'Output file'"))
+                .arg(Arg::from_usage("-i --input=<FILE>... 'Input raw.gz file(s) to use'"))
+                .arg(Arg::from_usage("-o --output=[FILE] 'Output basename. Defaults to input basename. Extension is set automatically.'"))
+                .arg(Arg::from_usage("-m --merge='Merge mulitple input files before generating output").required(false))
                 .arg(
-                    Arg::from_usage("-f --format=[FORMAT] 'Output format to write'")
+                    Arg::from_usage("-f --format=[FORMAT]... 'Output format(s) to write'")
                         .possible_values(&OutputFormat::variants())
                         .case_insensitive(true)
                         .default_value("flamegraph"),
@@ -847,7 +901,7 @@ impl Args {
                 let home = &std::env::var("userprofile")?;
 
                 let raw_path = output_filename(home, submatches.value_of("raw-file"), "raw.gz")?;
-                let out_path = output_filename(home, submatches.value_of("file"), &format.extension())?;
+                let out_path = output_filename(home, submatches.value_of("file"), &format.basename(""))?;
                 let maybe_duration = match value_t!(submatches, "duration", u64) {
                     Err(_) => None,
                     Ok(integer_duration) => Some(std::time::Duration::from_secs(integer_duration)),
@@ -881,10 +935,17 @@ impl Args {
                     silent,
                 }
             }
-            ("report", Some(submatches)) => Report {
-                format: value_t!(submatches, "format", OutputFormat).unwrap(),
-                input: value_t!(submatches, "input", String).unwrap().into(),
-                output: value_t!(submatches, "output", String).unwrap().into(),
+            ("report", Some(submatches)) => {
+                println!("submatches = {:?}", submatches);
+                let merged = submatches.occurrences_of("merge") > 0;
+                let rep = Report {
+                    formats: values_t!(submatches, "format", OutputFormat).unwrap(),
+                    input: values_t!(submatches, "input", PathBuf).unwrap(),
+                    output: value_t!(submatches, "output", String).ok(),
+                    merge: merged,
+                };
+                println!("report = {:?}", rep);
+                rep
             },
             _ => panic!("this shouldn't happen, please report the command you ran!"),
         };
@@ -1069,11 +1130,43 @@ mod tests {
             args,
             Args {
                 cmd: Report {
-                    format: OutputFormat::flamegraph,
-                    input: PathBuf::from("xyz.raw.gz"),
-                    output: PathBuf::from("xyz"),
+                    formats: vec![OutputFormat::flamegraph],
+                    input: vec![PathBuf::from("xyz.raw.gz")],
+                    output: Some("xyz".to_string()),
+                    merge: false,
                 },
             }
         );
+
+        let args = Args::from(make_args(
+                "rbspy report -m -f speedscope --input abc.raw.gz xyz.raw.gz"
+        )).unwrap();
+        assert_eq!(
+            args,
+            Args {
+                cmd: Report {
+                    formats: vec![OutputFormat::speedscope],
+                    input: vec![PathBuf::from("abc.raw.gz"), PathBuf::from("xyz.raw.gz")],
+                    output: None,
+                    merge: true,
+                },
+            }
+        );
+
+        let args = Args::from(make_args(
+                "rbspy report --merge -i abc.raw.gz xyz.raw.gz -o merged"
+        )).unwrap();
+        assert_eq!(
+            args,
+            Args {
+                cmd: Report {
+                    formats: vec![OutputFormat::flamegraph],
+                    input: vec![PathBuf::from("abc.raw.gz"), PathBuf::from("xyz.raw.gz")],
+                    output: Some("merged".to_string()),
+                    merge: true,
+                },
+            }
+        );
+
     }
 }

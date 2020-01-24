@@ -16,7 +16,7 @@ extern crate flate2;
 use std::io;
 use std::io::prelude::*;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::core::types::StackTrace;
 
@@ -123,4 +123,25 @@ pub(crate) fn from_reader<R: Read>(r: R) -> Result<v1::Data, Error> {
         }
         v => Err(StorageError::UnknownVersion(v).into()),
     }
+}
+
+
+pub(crate) fn from_readers<R: Read>(readers: Vec<R>) -> Result<Vec<v1::Data>, Error> {
+    let mut result : Vec<v1::Data> = Vec::new();
+
+    for reader in readers {
+        result.push(from_reader(reader)?);
+    }
+
+    Ok(result)
+}
+
+pub(crate) fn from_pathbufs(paths: Vec<PathBuf>) -> Result<v1::Data, Error> {
+    let mut result : Vec<StackTrace> = vec![];
+    for path in paths {
+        let data = from_reader(File::open(path)?)?;
+        result.append(&mut data.0.clone());
+    }
+
+    Ok(v1::Data(result))
 }
