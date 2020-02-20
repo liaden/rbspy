@@ -38,7 +38,7 @@ extern crate winapi;
 
 
 use chrono::prelude::*;
-use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
+use clap::{App, AppSettings, Arg, ArgMatches, SubCommand, Shell};
 use failure::Error;
 use failure::ResultExt;
 use rand::{thread_rng, Rng};
@@ -90,6 +90,17 @@ arg_enum!{
     }
 }
 
+arg_enum!{
+    #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+    pub enum ShellType {
+        Zsh,
+        Bash,
+        Fish,
+        Elvish,
+        PowerShell,
+    }
+}
+
 /// Subcommand.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 enum SubCmd {
@@ -108,6 +119,7 @@ enum SubCmd {
     /// Capture and print a stacktrace snapshot of process `pid`.
     Snapshot { pid: Pid },
     Report { format: OutputFormat, input: PathBuf, output: PathBuf, },
+    Completion { shell : ShellType },
 }
 use SubCmd::*;
 
@@ -200,6 +212,10 @@ fn do_main() -> Result<(), Error> {
             )
         },
         Report{format, input, output} => report(format, input, output),
+        Completion{shell} => {
+            arg_parser().gen_completions_to("rbspy", shell.to_clap_shell(), &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
@@ -316,6 +332,19 @@ impl OutputFormat {
             OutputFormat::summary => "summary.txt",
             OutputFormat::summary_by_line => "summary_by_line.txt",
         }.to_string()
+    }
+}
+
+impl ShellType {
+    fn to_clap_shell(self) -> Shell {
+        match self {
+            ShellType::Bash => Shell::Bash,
+            ShellType::Zsh => Shell::Zsh,
+            ShellType::Fish => Shell::Fish,
+            ShellType::Elvish => Shell::Elvish,
+            ShellType::PowerShell => Shell::PowerShell,
+            _ => panic!("unknown shell type")
+        }
     }
 }
 
@@ -812,6 +841,16 @@ fn arg_parser() -> App<'static, 'static> {
                         .default_value("flamegraph"),
                 )
         )
+        .subcommand(
+            SubCommand::with_name("completions")
+                .about("Generate completion script for your shell")
+                .arg(Arg::with_name("shell")
+                    .required(true)
+                    .possible_values(&ShellType::variants())
+                    .case_insensitive(true)
+                    .default_value("bash")
+                )
+        )
 }
 
 impl Args {
@@ -885,6 +924,9 @@ impl Args {
                 format: value_t!(submatches, "format", OutputFormat).unwrap(),
                 input: value_t!(submatches, "input", String).unwrap().into(),
                 output: value_t!(submatches, "output", String).unwrap().into(),
+            },
+            ("completions", Some(submatches)) => Completion {
+                shell: value_t!(submatches, "shell", ShellType).unwrap(),
             },
             _ => panic!("this shouldn't happen, please report the command you ran!"),
         };
